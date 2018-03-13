@@ -108,8 +108,8 @@ def PreActResNet18(num_classes=10):
     return PreActResNet(PreActBlock, [2, 2, 2, 2], num_classes=num_classes)
 
 
-def PreActResNet34():
-    return PreActResNet(PreActBlock, [3, 4, 6, 3])
+def PreActResNet34(num_classes=10):
+    return PreActResNet(PreActBlock, [3, 4, 6, 3], num_classes=num_classes)
 
 
 def PreActResNet50():
