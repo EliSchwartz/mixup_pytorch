@@ -14,22 +14,33 @@ import torch.backends.cudnn as cudnn
 import torchvision
 import torchvision.transforms as transforms
 
-from models import PreActResNet18
+from models import PreActResNet18, PreActResNet34
 from utils import progress_bar
 from torch.autograd import Variable
-
+from tqdm import tqdm
+import time
 
 parser = argparse.ArgumentParser(description='PyTorch CIFAR100 Training')
 parser.add_argument('--lr', default=0.1, type=float, help='learning rate')
-parser.add_argument('--resume', '-r', action='store_true',
+parser.add_argument('--epochs', default=200, type=int, help='Total number of epochs')
+parser.add_argument('--resume', '-r', type=str, default=None,
                     help='resume from checkpoint')
 parser.add_argument('--exp', default='cifar100_mixup', type=str,
                     help='name of the experiment')
 parser.add_argument('--mixup', action='store_true',
                     help='whether to use mixup or not')
+parser.add_argument('--datapath', default='~/datasets/cifar',
+                    help='datapath')
+parser.add_argument('--gpus', default='2',
+                    help='gpus to use, e.g. "0,1,3"')
+parser.add_argument('--model', default='resnet18',
+                    help='current supported models are "resnet18" and "resnet34"')
+parser.add_argument('--dataset', default='cifar100',
+                    help='current supported datasets are "cifar10" and "cifar100"')
 args = parser.parse_args()
 
-use_cuda = torch.cuda.is_available()
+
+
 best_acc = 0  # best test accuracy
 start_epoch = 0  # start from epoch 0 or last checkpoint epoch
 
@@ -47,45 +58,62 @@ transform_test = transforms.Compose([
     transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
 ])
 
-trainset = torchvision.datasets.CIFAR100(
-    root='/data/public/cifar100', train=True, download=True,
+if args.dataset == 'cifar10':
+    dataset_class = torchvision.datasets.CIFAR10
+    num_classes = 10
+elif args.dataset == 'cifar100':
+    dataset_class = torchvision.datasets.CIFAR100
+    num_classes = 100
+else:
+    raise NotImplementedError
+
+trainset = dataset_class(
+    root=args.datapath, train=True, download=True,
     transform=transform_train)
 trainloader = torch.utils.data.DataLoader(
     trainset, batch_size=128, shuffle=True, num_workers=2)
 
-testset = torchvision.datasets.CIFAR100(
-    root='/data/public/cifar100', train=False, download=True,
+testset = dataset_class(
+    root=args.datapath, train=False, download=True,
     transform=transform_test)
 testloader = torch.utils.data.DataLoader(
     testset, batch_size=100, shuffle=False, num_workers=2)
+
+
+print('==> Building model..')
+if args.model == 'resnet18':
+    net = PreActResNet18(num_classes=num_classes)
+elif args.model == 'resnet34':
+    net = PreActResNet34(num_classes=num_classes)
+else:
+    raise NotImplementedError
+# net = VGG('VGG19')
+# net = ResNet18()
+# net = GoogLeNet()
+# net = DenseNet121()
+# net = ResNeXt29_2x64d()
+# net = MobileNet()
+# net = DPN92()
+# net = ShuffleNetG2()
+# net = SENet18()
+
+if args.gpus is not None:
+    args.gpus = [int(i) for i in args.gpus.split(',')]
+    torch.cuda.set_device(args.gpus[0])
+    net.cuda()
+    net = torch.nn.DataParallel(net, args.gpus)
 
 # Model
 if args.resume:
     # Load checkpoint.
     print('==> Resuming from checkpoint..')
-    assert os.path.isdir('checkpoint'), 'Error: no checkpoint directory found!'
-    checkpoint = torch.load('./checkpoint_{}/ckpt.t7'.format(args.exp))
-    net = checkpoint['net']
+    if os.path.isdir(args.resume):
+        args.resume = os.path.join(args.resume, 'ckpt.t7')
+    checkpoint = torch.load(args.resume)
+    net.load_state_dict(checkpoint['state_dict'])
     best_acc = checkpoint['acc']
-    start_epoch = checkpoint['epoch']
-else:
-    print('==> Building model..')
-    # net = VGG('VGG19')
-    # net = ResNet18()
-    net = PreActResNet18(num_classes=100)
-    # net = GoogLeNet()
-    # net = DenseNet121()
-    # net = ResNeXt29_2x64d()
-    # net = MobileNet()
-    # net = DPN92()
-    # net = ShuffleNetG2()
-    # net = SENet18()
+    start_epoch = checkpoint['epoch'] + 1
 
-if use_cuda:
-    net.cuda()
-    net = torch.nn.DataParallel(
-        net, device_ids=range(torch.cuda.device_count()))
-    cudnn.benchmark = True
 
 criterion = nn.CrossEntropyLoss()
 optimizer = optim.SGD(net.parameters(), lr=args.lr,
@@ -117,16 +145,17 @@ def shuffle_minibatch(inputs, targets, mixup=True):
     targets2 = targets[rp2]
     targets2_1 = targets2.unsqueeze(1)
 
-    y_onehot = torch.FloatTensor(batch_size, 100)
+    y_onehot = torch.FloatTensor(batch_size, num_classes)
     y_onehot.zero_()
     targets1_oh = y_onehot.scatter_(1, targets1_1, 1)
 
-    y_onehot2 = torch.FloatTensor(batch_size, 100)
+    y_onehot2 = torch.FloatTensor(batch_size, num_classes)
     y_onehot2.zero_()
     targets2_oh = y_onehot2.scatter_(1, targets2_1, 1)
 
     if mixup is True:
-        a = numpy.random.beta(1, 1, [batch_size, 1])
+        alpha = 0.4
+        a = numpy.random.beta(alpha, alpha, [batch_size, 1])
     else:
         a = numpy.ones((batch_size, 1))
 
@@ -135,7 +164,7 @@ def shuffle_minibatch(inputs, targets, mixup=True):
     inputs1 = inputs1 * torch.from_numpy(b).float()
     inputs2 = inputs2 * torch.from_numpy(1 - b).float()
 
-    c = numpy.tile(a, [1, 100])
+    c = numpy.tile(a, [1, num_classes])
 
     targets1_oh = targets1_oh.float() * torch.from_numpy(c).float()
     targets2_oh = targets2_oh.float() * torch.from_numpy(1 - c).float()
@@ -153,11 +182,12 @@ def train(epoch):
     train_loss = 0
     correct = 0
     total = 0
+
     for batch_idx, (inputs, targets) in enumerate(trainloader):
         inputs_shuffle, targets_shuffle = shuffle_minibatch(
             inputs, targets, args.mixup)
 
-        if use_cuda:
+        if args.gpus is not None:
             inputs_shuffle, targets_shuffle = inputs_shuffle.cuda(), \
                 targets_shuffle.cuda()
 
@@ -167,7 +197,7 @@ def train(epoch):
             inputs_shuffle), Variable(targets_shuffle)
 
         outputs = net(inputs_shuffle)
-        m = nn.LogSoftmax()
+        m = nn.LogSoftmax(dim=1)
 
         loss = -m(outputs) * targets_shuffle
         loss = torch.sum(loss) / 128
@@ -180,11 +210,12 @@ def train(epoch):
         _, targets = torch.max(targets_shuffle.data, 1)
         correct += predicted.eq(targets).cpu().sum()
 
-        progress_bar(batch_idx, len(trainloader), 'Epoch %d, Training Loss: %.3f | Acc: %.3f%% (%d/%d)'  # noqa
-                     % (epoch, train_loss / (batch_idx + 1), 100. * correct / total, correct, total))  # noqa
+    return train_loss / (batch_idx + 1), 100. * correct / total
+        # progress_bar(batch_idx, len(trainloader), 'Epoch %d, Training Loss: %.3f | Acc: %.3f%% (%d/%d)'  # noqa
+        #              % (epoch, train_loss / (batch_idx + 1), 100. * correct / total, correct, total))  # noqa
 
 
-def test(epoch):
+def test(epoch=None):
     """Testing function."""
     global best_acc
     net.eval()
@@ -192,7 +223,7 @@ def test(epoch):
     correct = 0
     total = 0
     for batch_idx, (inputs, targets) in enumerate(testloader):
-        if use_cuda:
+        if args.gpus is not None:
             inputs, targets = inputs.cuda(), targets.cuda()
         inputs, targets = Variable(inputs, volatile=True), Variable(targets)
         outputs = net(inputs)
@@ -203,26 +234,58 @@ def test(epoch):
         total += targets.size(0)
         correct += predicted.eq(targets.data).cpu().sum()
 
-        progress_bar(batch_idx, len(testloader), 'Epoch %d, Test Loss: %.3f | Acc: %.3f%% (%d/%d)'  # noqa
-                     % (epoch, test_loss / (batch_idx + 1), 100. * correct / total, correct, total))  # noqa
+        # progress_bar(batch_idx, len(testloader), 'Epoch %d, Test Loss: %.3f | Acc: %.3f%% (%d/%d)'  # noqa
+        #              % (epoch, test_loss / (batch_idx + 1), 100. * correct / total, correct, total))  # noqa
 
-    # Save checkpoint.
     acc = 100. * correct / total
-    if acc > best_acc:
+    if epoch is not None and acc > best_acc:
+        # Save checkpoint.
         print('Saving..')
         state = {
-            'net': net.module if use_cuda else net,
+            'state_dict': net.state_dict(),
             'acc': acc,
             'epoch': epoch,
         }
-        if not os.path.isdir('checkpoint_{}'.format(args.exp)):
-            os.mkdir('checkpoint_{}'.format(args.exp))
-        torch.save(state, './checkpoint_{}/ckpt.t7'.format(args.exp))
+        checkpoint_path = './checkpoints/{}'.format(args.exp)
+        if not os.path.isdir(checkpoint_path):
+            os.mkdir(checkpoint_path)
+        torch.save(state, os.path.join(checkpoint_path, 'ckpt.t7'))
         best_acc = acc
+
+    return test_loss / (batch_idx + 1), acc, best_acc==acc
+
+def get_probs():
+    """Testing function."""
+    loader = torch.utils.data.DataLoader(
+        trainset, batch_size=100, shuffle=False, num_workers=2)
+    net.eval()
+    all_outputs = []
+    for batch_idx, (inputs, targets) in enumerate(testloader):
+        if args.gpus is not None:
+            inputs, targets = inputs.cuda(), targets.cuda()
+        inputs, targets = Variable(inputs, volatile=True), Variable(targets)
+        outputs = net(inputs)
+        all_outputs.append(outputs.cpu())
+
+    all_outputs = numpy.concatenate(all_outputs)
+    return all_outputs
 
 scheduler = lr_scheduler.MultiStepLR(
     optimizer, milestones=[100, 150], gamma=0.1)
-for epoch in range(start_epoch, start_epoch + 200):
+
+
+probs = get_probs()
+
+if start_epoch >= args.epochs:
+    print('Already trained, skiping to evaluation:\n')
+    test_loss, test_acc, _ = test()
+    print('Test loss: {:.3f}, Test accuracy: {:.2f}\n'.format(test_loss, test_acc))
+
+for epoch in tqdm(range(start_epoch, args.epochs), initial=start_epoch):
+    t = time.time()
     scheduler.step()
-    train(epoch)
-    test(epoch)
+    train_loss, train_acc = train(epoch)
+    test_loss, test_acc, is_best = test(epoch)
+    dur = time.time() - t
+    tqdm.write('\nTrain loss: {:.3f}, Train accuracy: {:.2f}, Test loss: {:.3f}, Test accuracy: {:.2f}, is best: {}, Duration: {:.2f}'.format(
+        train_loss, train_acc, test_loss, test_acc, is_best, dur))
